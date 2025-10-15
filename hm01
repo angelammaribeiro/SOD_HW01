@@ -1,0 +1,542 @@
+
+
+-- Add a new geometry column called "geom" to store GPS points
+-- Geometry type: Point, SRID: 4326 (WGS84 latitude/longitude)
+ALTER TABLE taxi_data_subset
+ADD COLUMN geom geometry(Point, 4326);
+
+-- Rename columns for easier handling (remove spaces, standardize names)
+ALTER TABLE taxi_data_subset RENAME COLUMN "Longitude" TO longitude;  -- X coordinate (East-West)
+ALTER TABLE taxi_data_subset RENAME COLUMN "Latitude" TO latitude;    -- Y coordinate (North-South)
+ALTER TABLE taxi_data_subset RENAME COLUMN "Date and Time" TO date_time;  -- timestamp of the GPS record
+
+-- Convert the "longitude" column to numeric type (double precision)
+-- Ensures coordinates can be used in spatial functions
+ALTER TABLE taxi_data_subset
+ALTER COLUMN longitude TYPE double precision
+USING longitude::double precision;
+
+-- Convert the "latitude" column to numeric type (double precision)
+-- Same reason: enforce numeric type for spatial processing
+ALTER TABLE taxi_data_subset
+ALTER COLUMN latitude TYPE double precision
+USING latitude::double precision;
+
+-- ------------------------------------------------------------
+-- Fix swapped coordinate columns and rebuild geometry (minimal)
+-- Context: the source CSV had Longitude/Latitude swapped.
+-- We rename to make semantics explicit, then construct
+-- geom = POINT(lon, lat) in EPSG:4326 (WGS84).
+-- ------------------------------------------------------------
+
+-- 1) Quick sanity peek at the original raw columns before changes
+--    (Expect values near Rome: lon ≈ 12.x, lat ≈ 41.x; if reversed, they’ll look flipped.)
+SELECT longitude AS orig_longitude, latitude AS orig_latitude
+FROM taxi_data_subset
+LIMIT 5;
+
+-- 2) Rename mis-labeled columns to reflect their *actual* contents
+--    "Longitude" actually contained latitude values  -> lat_raw
+--    "Latitude"  actually contained longitude values -> lon_raw
+ALTER TABLE taxi_data_subset RENAME COLUMN longitude TO lat_raw;  -- holds latitude values
+ALTER TABLE taxi_data_subset RENAME COLUMN latitude  TO lon_raw;  -- holds longitude values
+
+-- 3) Build correct point geometries in-place:
+--    ST_MakePoint expects (X, Y) = (longitude, latitude) = (lon_raw, lat_raw)
+--    Assumes 'geom' column already exists and is geometry(Point,4326).
+UPDATE taxi_data_subset
+SET geom = ST_SetSRID(ST_MakePoint(lon_raw, lat_raw), 4326);
+
+-- 4) Optional checks
+
+-- 4a) Confirm SRID registration (should be 4326)
+SELECT Find_SRID('public', 'taxi_data_subset', 'geom');
+
+-- 4b) Verify the X/Y coordinates match our lon/lat columns
+SELECT id,
+       lon_raw AS lon, lat_raw AS lat,
+       ST_X(geom) AS x_from_geom, ST_Y(geom) AS y_from_geom
+FROM taxi_data_subset
+LIMIT 5;
+
+-- ------------------------------------------------------------
+-- Create small, test-sized subsets of taxi points and roads
+-- Area of interest: tiny envelope in Rome (EPSG:4326 / WGS84)
+-- Envelope arguments: (minLon, minLat, maxLon, maxLat, SRID)
+-- ------------------------------------------------------------
+
+-- 1) Crop taxi points to those strictly inside the envelope
+CREATE TABLE taxi_cropped AS
+SELECT *
+FROM taxi_data_subset
+WHERE ST_Within(
+  geom,
+  ST_MakeEnvelope(12.4852147, 41.9025643, 12.4858663, 41.9029739, 4326)
+);
+
+-- Optional: quick preview to confirm the crop worked
+SELECT COUNT(*) AS taxi_cropped_count FROM taxi_cropped;
+SELECT * FROM taxi_cropped LIMIT 5;
+
+-- 2) Crop roads to those that intersect the same envelope
+--    ST_Intersects is inclusive; any road segment that touches the box is kept.
+CREATE TABLE roads_cropped AS
+SELECT *
+FROM roma_roads
+WHERE ST_Intersects(
+  geom,
+  ST_MakeEnvelope(12.4852147, 41.9025643, 12.4858663, 41.9029739, 4326)
+);
+
+-- Optional: quick preview for roads
+SELECT COUNT(*) AS roads_cropped_count FROM roads_cropped;
+SELECT * FROM roads_cropped LIMIT 5;
+
+-- ------------------------------------------------------------
+-- Map-matching: snap each taxi GPS point to its nearest road segment
+-- Strategy: for each taxi point, find the closest road geometry
+-- using a KNN (<->) search, then compute the closest point
+-- on that road (snapped_geom).
+-- ------------------------------------------------------------
+
+-- 1) Run map-matching on the CROPPED subset (small test area)
+--    Rationale: the cropped area is tiny, so the query is fast even without indexes.
+--    - For each taxi point (t.geom), find the nearest road (ORDER BY <-> LIMIT 1).
+--    - ST_ClosestPoint returns the precise snapped point on the road geometry.
+CREATE TABLE taxi_matched AS
+SELECT 
+    t.id,
+    t.date_time,
+    t.geom AS original_geom,              -- raw GPS point
+    r.osm_id,
+    r.geom AS road_geom,                  -- full matched road segment
+    ST_ClosestPoint(r.geom, t.geom) AS snapped_geom -- snapped point on road
+FROM taxi_cropped t
+JOIN LATERAL (
+    SELECT r.osm_id, r.geom
+    FROM roads_cropped r
+    ORDER BY t.geom <-> r.geom            -- KNN search
+    LIMIT 1                               -- keep only the nearest road
+) r ON true;
+
+-- 2) Before running map-matching on the COMPLETE dataset, create spatial indexes.
+--    We first tried without indexes; it ran for a very long time and didn’t finish.
+--    With GiST indexes, the same KNN query completed in milliseconds.
+CREATE INDEX IF NOT EXISTS idx_taxi_geom   ON taxi_data_subset USING gist (geom);
+CREATE INDEX IF NOT EXISTS idx_roads_geom  ON roma_roads       USING gist (geom);
+
+-- 3) Run the same process on the COMPLETE dataset (all taxi points + full road network)
+--    Produces taxi_matched_complete, same structure as taxi_matched but full coverage.
+CREATE TABLE taxi_matched_complete AS
+SELECT 
+    t.id,
+    t.date_time,
+    t.geom AS original_geom,
+    r.osm_id,
+    r.geom AS road_geom,
+    ST_ClosestPoint(r.geom, t.geom) AS complete_geom
+FROM taxi_data_subset t
+JOIN LATERAL (
+    SELECT r.osm_id, r.geom
+    FROM roma_roads r
+    ORDER BY t.geom <-> r.geom
+    LIMIT 1
+) r ON true;
+
+/* ======================================================================
+   ONE-TIME PREP: make roads LINESTRING-only + spatial index
+   Reason: source roads are MULTILINESTRING; functions like
+           ST_LineLocatePoint/ST_LineSubstring expect LINESTRING.
+   ====================================================================== */
+
+DROP TABLE IF EXISTS roma_roads_linear;
+
+CREATE TABLE roma_roads_linear AS
+SELECT
+  rr.osm_id,
+  (ST_Dump(rr.geom)).geom::geometry(LineString, 4326) AS geom
+FROM roma_roads rr;
+
+-- Spatial index ~ essential for KNN (<->) performance
+CREATE INDEX IF NOT EXISTS idx_roma_roads_linear_geom
+  ON roma_roads_linear
+  USING gist (geom);
+
+
+/* ======================================================================
+   TOPOLOGICAL MAP-MATCHING (v1): heading-aware using forward heading only
+   - Computes vehicle heading from current -> next point (per DriveNo).
+   - For each GPS point, tests K nearest road candidates and
+     estimates the local road heading near the projection.
+   - Scores each candidate: distance(m) + heading_weight * heading_diff(deg).
+   - Picks the best (lowest score) per point.
+   Note: This version drops rows that have no forward heading (last point of
+         each drive and zero-movement forward pairs).
+   ====================================================================== */
+
+DROP TABLE IF EXISTS taxi_matched_topo;
+
+CREATE TABLE taxi_matched_topo AS
+WITH params AS (
+  -- Tunables:
+  --   heading_weight (m/deg): how strongly to favor heading alignment
+  --   candidates_k:           how many nearest roads to consider
+  SELECT 5.0::double precision AS heading_weight, 5::int AS candidates_k
+),
+
+-- 1) Order by trip/time and compute the forward neighbor
+ordered AS (
+  SELECT
+    t.id,
+    t."DriveNo" AS drive_no,
+    t.date_time::timestamp AS ts,
+    t.geom,
+    LEAD(t.geom) OVER (
+      PARTITION BY t."DriveNo" ORDER BY t.date_time::timestamp
+    ) AS next_geom
+  FROM taxi_data_subset t
+),
+
+-- 2) Vehicle heading: azimuth(current -> next); degrees
+veh AS (
+  SELECT
+    id, drive_no, ts, geom, next_geom,
+    CASE WHEN next_geom IS NOT NULL
+         THEN DEGREES(ST_Azimuth(geom, next_geom))
+         ELSE NULL
+    END AS heading_deg
+  FROM ordered
+),
+
+-- 3) Candidate roads + local road heading near the projected point
+scored AS (
+  SELECT
+    v.id,
+    v.drive_no,
+    v.ts,
+    v.geom AS original_geom,
+    r.osm_id,
+    r.geom AS road_geom,
+
+    -- Snap to road + position along the road (0..1)
+    ST_ClosestPoint(r.geom, v.geom) AS snapped_geom,
+    ST_LineLocatePoint(r.geom, v.geom) AS loc,
+
+    -- Local segment around projection (for stable road heading)
+    COALESCE(
+      NULLIF(
+        ST_LineSubstring(
+          r.geom,
+          GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+          LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+        ),
+        '010200000000000000'::geometry  -- empty linestring literal
+      ),
+      r.geom
+    ) AS local_seg,
+
+    -- Distance (meters) from GPS to its projection
+    ST_DistanceSphere(v.geom, ST_ClosestPoint(r.geom, v.geom)) AS distance_m,
+
+    v.heading_deg,
+
+    -- Road heading (degrees) from local segment (fallback to full line)
+    CASE
+      WHEN ST_NPoints(
+             COALESCE(
+               NULLIF(
+                 ST_LineSubstring(
+                   r.geom,
+                   GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                   LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                 ),
+                 '010200000000000000'::geometry
+               ),
+               r.geom
+             )
+           ) >= 2
+      THEN DEGREES(
+             ST_Azimuth(
+               ST_StartPoint(
+                 COALESCE(
+                   NULLIF(
+                     ST_LineSubstring(
+                       r.geom,
+                       GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                       LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                     ),
+                     '010200000000000000'::geometry
+                   ),
+                   r.geom
+                 )
+               ),
+               ST_EndPoint(
+                 COALESCE(
+                   NULLIF(
+                     ST_LineSubstring(
+                       r.geom,
+                       GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                       LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                     ),
+                     '010200000000000000'::geometry
+                   ),
+                   r.geom
+                 )
+               )
+             )
+           )
+      ELSE NULL
+    END AS road_heading_deg
+  FROM veh v
+  JOIN params p ON true
+  JOIN LATERAL (            -- K nearest candidate roads
+    SELECT r.osm_id, r.geom
+    FROM roma_roads_linear r
+    WHERE r.geom && ST_Expand(v.geom, 0.01)        -- bbox prefilter (~1 km)
+    ORDER BY v.geom <-> r.geom                     -- KNN using GiST
+    LIMIT p.candidates_k
+  ) r ON true
+  WHERE v.heading_deg IS NOT NULL                  -- drops endpoints / no fwd heading
+),
+
+-- 4) Score = distance + weighted heading mismatch
+scored2 AS (
+  SELECT
+    s.*,
+    -- robust angular difference in degrees ([-180,180])
+    ABS(
+      DEGREES(
+        ATAN2(
+          SIN(RADIANS(s.heading_deg - s.road_heading_deg)),
+          COS(RADIANS(s.heading_deg - s.road_heading_deg))
+        )
+      )
+    ) AS heading_diff_deg,
+    -- combined score
+    s.distance_m
+      + p.heading_weight *
+        ABS(
+          DEGREES(
+            ATAN2(
+              SIN(RADIANS(s.heading_deg - s.road_heading_deg)),
+              COS(RADIANS(s.heading_deg - s.road_heading_deg))
+            )
+          )
+        ) AS score
+  FROM scored s
+  JOIN params p ON true
+),
+
+-- 5) Keep best candidate per GPS point (lowest score)
+best AS (
+  SELECT DISTINCT ON (id)
+    id, drive_no, ts, original_geom, osm_id, road_geom, snapped_geom,
+    distance_m, heading_deg, road_heading_deg, heading_diff_deg, score
+  FROM scored2
+  ORDER BY id, score ASC
+)
+
+-- Final materialization
+SELECT
+  b.id,
+  b.drive_no,
+  b.ts AS date_time,
+  b.original_geom,
+  b.osm_id,
+  b.road_geom,
+  b.snapped_geom                 AS snapped_geom_topo,
+  b.distance_m,
+  b.heading_deg,
+  b.road_heading_deg,
+  b.heading_diff_deg,
+  b.score
+FROM best b;
+
+/* ======================================================================
+   TOPOLOGICAL MAP-MATCHING (v2: full coverage)
+   - Improves v1 by:
+     * using forward OR backward heading (covers endpoints / zero-move fwd),
+     * LEFT LATERAL join (keeps GPS rows even if bbox finds no roads),
+     * slightly wider bbox,
+     * distance-only fallback when heading is missing.
+   - This is the version that yielded ~10,000/10,000 rows
+   ====================================================================== */
+
+DROP TABLE IF EXISTS taxi_matched_topo_full;
+
+CREATE TABLE taxi_matched_topo_full AS
+WITH params AS (
+  SELECT 5.0::double precision AS heading_weight, 5::int AS candidates_k
+),
+
+-- A) Forward & backward neighbors per trip, ordered by time
+ordered AS (
+  SELECT
+    t.id,
+    t."DriveNo" AS drive_no,
+    t.date_time::timestamp AS ts,
+    t.geom,
+    LEAD(t.geom) OVER (PARTITION BY t."DriveNo" ORDER BY t.date_time::timestamp) AS next_geom,
+    LAG (t.geom) OVER (PARTITION BY t."DriveNo" ORDER BY t.date_time::timestamp) AS prev_geom
+  FROM taxi_data_subset t
+),
+
+-- B) Heading: prefer forward; else backward; else NULL
+veh AS (
+  SELECT
+    id, drive_no, ts, geom, next_geom, prev_geom,
+    CASE
+      WHEN next_geom IS NOT NULL AND NOT ST_Equals(geom, next_geom)
+        THEN DEGREES(ST_Azimuth(geom, next_geom))
+      WHEN prev_geom IS NOT NULL AND NOT ST_Equals(prev_geom, geom)
+        THEN DEGREES(ST_Azimuth(prev_geom, geom))
+      ELSE NULL
+    END AS heading_deg
+  FROM ordered
+),
+
+-- C) Candidate roads (using the pre-cleaned LINESTRING table)
+scored AS (
+  SELECT
+    v.id, v.drive_no, v.ts, v.geom AS original_geom,
+    r.osm_id, r.geom AS road_geom,
+    ST_ClosestPoint(r.geom, v.geom) AS snapped_geom,
+    ST_DistanceSphere(v.geom, ST_ClosestPoint(r.geom, v.geom)) AS distance_m,
+    v.heading_deg,
+    -- Local road heading near projection, same logic as v1
+    CASE
+      WHEN ST_NPoints(
+             COALESCE(
+               NULLIF(
+                 ST_LineSubstring(
+                   r.geom,
+                   GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                   LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                 ),
+                 '010200000000000000'::geometry
+               ),
+               r.geom
+             )
+           ) >= 2
+      THEN DEGREES(
+             ST_Azimuth(
+               ST_StartPoint(
+                 COALESCE(
+                   NULLIF(
+                     ST_LineSubstring(
+                       r.geom,
+                       GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                       LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                     ),
+                     '010200000000000000'::geometry
+                   ),
+                   r.geom
+                 )
+               ),
+               ST_EndPoint(
+                 COALESCE(
+                   NULLIF(
+                     ST_LineSubstring(
+                       r.geom,
+                       GREATEST(0.0, ST_LineLocatePoint(r.geom, v.geom) - 0.001),
+                       LEAST(1.0,  ST_LineLocatePoint(r.geom, v.geom) + 0.001)
+                     ),
+                     '010200000000000000'::geometry
+                   ),
+                   r.geom
+                 )
+               )
+             )
+           )
+      ELSE NULL
+    END AS road_heading_deg
+  FROM veh v
+  -- LEFT LATERAL keeps the GPS point even if no road falls inside the bbox
+  LEFT JOIN LATERAL (
+    SELECT r.osm_id, r.geom
+    FROM roma_roads_linear r
+    WHERE r.geom && ST_Expand(v.geom, 0.02)        -- slightly wider bbox
+    ORDER BY v.geom <-> r.geom
+    LIMIT (SELECT candidates_k FROM params)
+  ) r ON true
+),
+
+-- D) Score with distance-only fallback when heading is missing
+scored2 AS (
+  SELECT
+    s.*,
+    CASE
+      WHEN s.heading_deg IS NOT NULL AND s.road_heading_deg IS NOT NULL
+      THEN ABS(
+             DEGREES(
+               ATAN2(
+                 SIN(RADIANS(s.heading_deg - s.road_heading_deg)),
+                 COS(RADIANS(s.heading_deg - s.road_heading_deg))
+               )
+             )
+           )
+      ELSE NULL
+    END AS heading_diff_deg,
+    s.distance_m
+      + (SELECT heading_weight FROM params) *
+        COALESCE(
+          ABS(
+            DEGREES(
+              ATAN2(
+                SIN(RADIANS(s.heading_deg - s.road_heading_deg)),
+                COS(RADIANS(s.heading_deg - s.road_heading_deg))
+              )
+            )
+          ), 0.0           -- if heading is NULL, add 0 (distance-only)
+        ) AS score
+  FROM scored s
+),
+
+-- E) Best candidate per id (prefer rows that have a road candidate)
+best AS (
+  SELECT DISTINCT ON (id)
+    id, drive_no, ts, original_geom, osm_id, road_geom, snapped_geom,
+    distance_m, heading_deg, road_heading_deg, heading_diff_deg, score
+  FROM scored2
+  ORDER BY id,
+           CASE WHEN osm_id IS NULL THEN 1 ELSE 0 END,  -- prefer having a candidate
+           score ASC
+)
+
+SELECT
+  b.id,
+  b.drive_no,
+  b.ts AS date_time,
+  b.original_geom,
+  b.osm_id,
+  b.road_geom,
+  b.snapped_geom AS snapped_geom_topo,
+  b.distance_m,
+  b.heading_deg,
+  b.road_heading_deg,
+  b.heading_diff_deg,
+  b.score
+FROM best b;
+/* ======================================================================
+   QUICK QA QUERIES (optional)
+   ====================================================================== */
+
+-- Count rows (v2 should be ~10000 now)
+SELECT COUNT(*) FROM taxi_matched_topo_full;
+
+-- If any, rows with no candidate road (osm_id NULL)
+SELECT COUNT(*) FROM taxi_matched_topo_full WHERE osm_id IS NULL;
+
+-- Geometry types (sanity)
+SELECT GeometryType(geom), COUNT(*) FROM roma_roads GROUP BY 1;
+SELECT GeometryType(geom), COUNT(*) FROM roma_roads_linear GROUP BY 1;
+
+-- Basic distance/heading stats for v1 (if you want)
+SELECT
+  MIN(distance_m) AS min_m,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY distance_m) AS p50_m,
+  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY distance_m) AS p95_m,
+  MAX(distance_m) AS max_m,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY heading_diff_deg) AS p50_heading_diff,
+  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY heading_diff_deg) AS p95_heading_diff
+FROM taxi_matched_topo;

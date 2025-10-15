@@ -1,0 +1,27 @@
+# IDE / system
+.idea/
+.DS_Store
+.idea/
+.DS_Store
+
+# caches / temp
+cache/
+*.tmp
+
+# large geospatial / archives / docs
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tif
+*.pdf
+
+# Shapefile family & GIS data
+*.shp
+*.dbf
+*.shx
+*.prj
+*.qgz
+*.gpkg
+*.geojson
+*.gejson

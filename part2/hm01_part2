@@ -1,0 +1,208 @@
+-- =====================================================================
+-- HW Part 2.2–2.3  |  Map-matching on a graph + Performance evaluation
+-- Assumptions:
+--   * taxi_data_subset( id, date_time, geom POINT, SRID 4326 )
+--   * rome_edges( id, geom LINESTRING, SRID 4326 )
+-- =====================================================================
+
+BEGIN;
+
+-- ---------------------------------------------------------------------
+-- 0) Sanity + prerequisites
+-- ---------------------------------------------------------------------
+-- SELECT ST_SRID(geom) FROM taxi_data_subset LIMIT 1;  -- expect 4326
+-- SELECT ST_SRID(geom) FROM rome_edges        LIMIT 1;  -- expect 4326
+
+CREATE INDEX IF NOT EXISTS idx_taxi_geom  ON taxi_data_subset USING gist (geom);
+CREATE INDEX IF NOT EXISTS idx_edges_geom ON rome_edges        USING gist (geom);
+ANALYZE taxi_data_subset;
+ANALYZE rome_edges;
+
+-- =====================================================================
+-- 1) BASELINE MATCHERS (for comparison)
+-- =====================================================================
+
+-- 1A) Pure KNN baseline (fast, no radius preference)
+DROP TABLE IF EXISTS tmg_knn;
+CREATE TABLE tmg_knn AS
+SELECT
+  t.id                               AS point_id,
+  t.date_time,
+  t.geom                             AS original_geom,
+  e.id                               AS edge_id,
+  e.geom                             AS edge_geom,
+  ST_ClosestPoint(e.geom, t.geom)    AS snapped_geom,
+  ST_DistanceSphere(
+    t.geom, ST_ClosestPoint(e.geom, t.geom)
+  )                                   AS snap_dist_m
+FROM taxi_data_subset AS t
+CROSS JOIN LATERAL (
+  SELECT id, geom
+  FROM rome_edges
+  ORDER BY t.geom <-> geom            -- GiST KNN
+  LIMIT 1
+) AS e;
+
+CREATE INDEX IF NOT EXISTS idx_tmg_knn_snapped ON tmg_knn USING gist (snapped_geom);
+ANALYZE tmg_knn;
+
+-- 1B) “50 m first” baseline using GEOGRAPHY (meters) + KNN fallback
+--     (Correct way to express 50 m on WGS84 without projecting.)
+DROP TABLE IF EXISTS tmg_geo50;
+CREATE TABLE tmg_geo50 AS
+SELECT
+  t.id                            AS point_id,
+  t.date_time,
+  t.geom                          AS original_geom,
+  e.id                            AS edge_id,
+  e.geom                          AS edge_geom,
+  ST_ClosestPoint(e.geom, t.geom) AS snapped_geom,
+  ST_DistanceSphere(
+    t.geom, ST_ClosestPoint(e.geom, t.geom)
+  )                                AS snap_dist_m
+FROM taxi_data_subset AS t
+CROSS JOIN LATERAL (
+  SELECT id, geom
+  FROM rome_edges
+  ORDER BY
+    CASE WHEN ST_DWithin(geom::geography, t.geom::geography, 50) THEN 0 ELSE 1 END,
+    t.geom <-> geom
+  LIMIT 1
+) AS e;
+
+CREATE INDEX IF NOT EXISTS idx_tmg_geo50_snapped ON tmg_geo50 USING gist (snapped_geom);
+ANALYZE tmg_geo50;
+
+-- =====================================================================
+-- 2) OPTIMIZATION: 50 m BUFFER PER EDGE + GiST (R-tree)
+--     Cheap indexed prefilter with ST_Intersects, then KNN.
+-- =====================================================================
+
+-- 2A) Build stored buffer column (generate in meters via UTM33 → back to 4326)
+ALTER TABLE rome_edges DROP COLUMN IF EXISTS edge_buf;
+ALTER TABLE rome_edges
+ADD COLUMN edge_buf geometry(Polygon, 4326)
+GENERATED ALWAYS AS (
+  ST_Transform(
+    ST_Buffer( ST_Transform(geom, 32633), 50 ),  -- 50 m in EPSG:32633 (meters)
+    4326
+  )
+) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_edges_edgebuf ON rome_edges USING gist (edge_buf);
+ANALYZE rome_edges;
+
+-- 2B) Optimized matcher: buffer prefilter + KNN order
+DROP TABLE IF EXISTS tmg_buffered;
+CREATE TABLE tmg_buffered AS
+SELECT
+  t.id                            AS point_id,
+  t.date_time,
+  t.geom                          AS original_geom,
+  e.id                            AS edge_id,
+  e.geom                          AS edge_geom,
+  ST_ClosestPoint(e.geom, t.geom) AS snapped_geom,
+  ST_DistanceSphere(
+    t.geom, ST_ClosestPoint(e.geom, t.geom)
+  )                                AS snap_dist_m,
+  -- did we find a candidate inside the buffer stage?
+  ST_Intersects(e.edge_buf, t.geom) AS used_buffer
+FROM taxi_data_subset AS t
+CROSS JOIN LATERAL (
+  SELECT id, geom, edge_buf
+  FROM rome_edges
+  ORDER BY
+    CASE WHEN ST_Intersects(edge_buf, t.geom) THEN 0 ELSE 1 END,  -- indexed prefilter
+    t.geom <-> geom                                               -- KNN refinement
+  LIMIT 1
+) AS e;
+
+CREATE INDEX IF NOT EXISTS idx_tmg_buffered_snapped ON tmg_buffered USING gist (snapped_geom);
+ANALYZE tmg_buffered;
+
+-- =====================================================================
+-- 3) SAMPLE FOR BENCHMARKING (+ views for QGIS)
+-- =====================================================================
+
+-- 3A) Random sample for visual comparison (≈1000 points)
+DROP MATERIALIZED VIEW IF EXISTS mm_sample;
+CREATE MATERIALIZED VIEW mm_sample AS
+SELECT id AS point_id, date_time, geom
+FROM taxi_data_subset
+ORDER BY random()
+LIMIT 1000;
+
+-- 3B) Join sample with each result (views so they stay current)
+CREATE OR REPLACE VIEW v_sample_knn AS
+SELECT s.point_id, s.geom AS sample_geom, m.edge_id, m.snapped_geom, m.snap_dist_m
+FROM mm_sample s JOIN tmg_knn     m ON m.point_id = s.point_id;
+
+CREATE OR REPLACE VIEW v_sample_geo50 AS
+SELECT s.point_id, s.geom AS sample_geom, m.edge_id, m.snapped_geom, m.snap_dist_m
+FROM mm_sample s JOIN tmg_geo50   m ON m.point_id = s.point_id;
+
+CREATE OR REPLACE VIEW v_sample_buffered AS
+SELECT s.point_id, s.geom AS sample_geom, m.edge_id, m.snapped_geom, m.snap_dist_m, m.used_buffer
+FROM mm_sample s JOIN tmg_buffered m ON m.point_id = s.point_id;
+
+-- 3C) Error vectors (handy for QGIS)
+CREATE OR REPLACE VIEW v_errors_knn AS
+SELECT point_id, ST_MakeLine(sample_geom, snapped_geom) AS error_vec, snap_dist_m
+FROM v_sample_knn;
+
+CREATE OR REPLACE VIEW v_errors_buffered AS
+SELECT point_id, ST_MakeLine(sample_geom, snapped_geom) AS error_vec, snap_dist_m, used_buffer
+FROM v_sample_buffered;
+
+-- =====================================================================
+-- 4) QUALITY METRICS 
+-- =====================================================================
+
+-- Helper: summarize error in meters
+WITH stats AS (
+  SELECT 'knn' AS m,  snap_dist_m FROM tmg_knn
+  UNION ALL
+  SELECT 'geo50',     snap_dist_m FROM tmg_geo50
+  UNION ALL
+  SELECT 'buffered',  snap_dist_m FROM tmg_buffered
+)
+SELECT m AS method,
+       COUNT(*)                                             AS n_pts,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY snap_dist_m)::numeric, 2) AS p50_m,
+       ROUND(PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY snap_dist_m)::numeric, 2) AS p90_m,
+       ROUND(100*AVG((snap_dist_m>30)::int)::numeric, 2)                            AS pct_over_30m
+FROM stats
+GROUP BY m
+ORDER BY m;
+
+-- =====================================================================
+-- 5) PERFORMANCE EVIDENCE (optional, run individually)
+-- =====================================================================
+-- In psql run: \timing on   (to capture wall-clock)
+-- Then run these EXPLAINs on a manageable subset (e.g., LIMIT 10k).
+
+-- -- EXPLAIN KNN baseline
+-- EXPLAIN (ANALYZE, BUFFERS, SUMMARY)
+-- SELECT t.id, e.id
+-- FROM (SELECT * FROM taxi_data_subset ORDER BY id LIMIT 10000) t
+-- CROSS JOIN LATERAL (
+--   SELECT id, geom
+--   FROM rome_edges
+--   ORDER BY t.geom <-> geom
+--   LIMIT 1
+-- ) e;
+
+-- -- EXPLAIN Optimized (buffer + KNN)
+-- EXPLAIN (ANALYZE, BUFFERS, SUMMARY)
+-- SELECT t.id, e.id
+-- FROM (SELECT * FROM taxi_data_subset ORDER BY id LIMIT 10000) t
+-- CROSS JOIN LATERAL (
+--   SELECT id, geom, edge_buf
+--   FROM rome_edges
+--   ORDER BY
+--     CASE WHEN ST_Intersects(edge_buf, t.geom) THEN 0 ELSE 1 END,
+--     t.geom <-> geom
+--   LIMIT 1
+-- ) e;
+
+COMMIT;
